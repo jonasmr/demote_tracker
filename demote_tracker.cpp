@@ -1,4 +1,4 @@
-#define INITGUID
+﻿#define INITGUID
 #include <windows.h>
 #include <evntrace.h>
 #include <evntcons.h>
@@ -12,6 +12,10 @@
 #include <mutex>
 #include <conio.h>
 
+
+#include <io.h>
+#include <shellapi.h>
+#include <fcntl.h>
 #include <dxgi1_4.h>
 
 // Microsoft-Windows-DxgKrnl provider GUID
@@ -194,6 +198,7 @@ static int											 g_processFirstFree = -1;
 static std::unordered_map<DWORD, int>				 g_pidToProcess;
 static std::unordered_map<ProcessKey, ProcessMemory> g_processMemory;
 static std::unordered_map<PVOID, Adapter>			 g_adapters;
+static bool g_verbose = false;
 
 // Console Stuff
 static HANDLE				  g_hConsole		   = NULL;
@@ -212,6 +217,9 @@ static int		   g_PrioTocolor[6]	  = { CYAN, YELLOW, DARK_YELLOW, RED, DARK_RED, 
 static const char* g_prioNames[6]	  = { "?", "MIN", "LOW", "NORMAL", "HIGH", "MAX" };
 static int		   g_adapterToColor[] = { YELLOW, WHITE, MAGENTA, RED, CYAN, WHITE, BLUE, GREEN };
 static int		   g_numAdapterColors = sizeof(g_adapterToColor) / sizeof(g_adapterToColor[0]);
+
+
+static FILE* g_LogFile = nullptr;
 
 wstring FindProcName(DWORD pid)
 {
@@ -592,6 +600,12 @@ void HandleVidMmProcessDemotedCommitmentChange(PEVENT_RECORD pEvent)
 	int			   prio				= PRIO_MAX < PriorityClass ? PRIO_MAX : PriorityClass;
 	ProcessMemory* memory			= FindProcessMemory(ProcessId, pDxgAdapter);
 	memory->CommitmentDemoted[prio] = Commitment;
+
+	if(g_verbose)
+	{
+		fprintf(g_LogFile, "DEM %lld <- %lld %p, %d. %d %d\n", Commitment, OldCommitment, pDxgAdapter, ProcessId, PhysicalAdapterIndex, PriorityClass);
+		fflush(g_LogFile);
+	}
 }
 
 void HandleVidMmProcessCommitmentChange(PEVENT_RECORD pEvent)
@@ -654,6 +668,9 @@ void HandleReportSegment(PEVENT_RECORD pEvent)
 	Adapter* adapter = FindAdapter(pDxgAdapter);
 	if(MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL)
 		adapter->LocalMemory += Size;
+
+	fprintf(g_LogFile, "Adapter Segment %ls: %6.fMB / %s\n", adapter->name.c_str(), Size / (1024.f * 1024.f), MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL ? "Local" : "NonLocal");
+	fflush(g_LogFile);
 }
 
 void HandleAdapterStart(PEVENT_RECORD pEvent)
@@ -863,8 +880,11 @@ static void Put(char c)
 	if(g_currentX < g_consoleWidth)
 	{
 		int idx						   = g_currentY * g_consoleWidth + g_currentX;
-		g_chars.at(idx).Char.AsciiChar = c;
-		g_chars.at(idx).Attributes	   = (WORD)g_currentColor;
+		if(idx < g_chars.size())
+		{
+			g_chars.at(idx).Char.AsciiChar = c;
+			g_chars.at(idx).Attributes	   = (WORD)g_currentColor;
+		}
 		g_currentX += 1;
 	}
 };
@@ -880,9 +900,11 @@ static void PutFormat(const char* fmt, Args&&... args) /// wtf is going on with 
 		while(i < r && g_currentX < g_consoleWidth)
 		{
 			int idx						   = base + g_currentX;
-			g_chars.at(idx).Char.AsciiChar = buffer[i];
-			g_chars.at(idx).Attributes	   = (WORD)g_currentColor;
-
+			if(idx < g_chars.size())
+			{
+				g_chars.at(idx).Char.AsciiChar = buffer[i];
+				g_chars.at(idx).Attributes	   = (WORD)g_currentColor;
+			}
 			g_currentX += 1;
 			i++;
 		}
@@ -1143,10 +1165,60 @@ void ConsoleUpdate()
 	g_currentColor = (WHITE);
 }
 
-int wmain(int argc, wchar_t* argv[])
+
+
+static void EnableUTF8()
 {
-	(void)argc;
-	(void)argv;
+	SetConsoleOutputCP(CP_UTF8);
+	SetConsoleCP(CP_UTF8);
+
+	_setmode(_fileno(stdout), _O_U8TEXT);
+	_setmode(_fileno(stderr), _O_U8TEXT);
+	_setmode(_fileno(stdin), _O_U8TEXT);
+}
+
+static void RedirectStdIO()
+{
+	FILE* fp;
+	freopen_s(&fp, "CONOUT$", "w", stdout);
+	freopen_s(&fp, "CONOUT$", "w", stderr);
+	freopen_s(&fp, "CONIN$", "r", stdin);
+}
+
+void ParseCommandLine()
+{
+	int		argc  = 0;
+	LPWSTR* argv  = CommandLineToArgvW(GetCommandLineW(), &argc);
+	bool	found = false;
+	for(int i = 1; i < argc; ++i)
+	{
+		if(lstrcmpiW(argv[i], L"-v") == 0 || lstrcmpiW(argv[i], L"--verbose") == 0)
+		{
+			g_verbose = true;
+			break;
+		}
+	}
+
+}
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+{
+	ParseCommandLine();
+	fopen_s(&g_LogFile, "demote_tracker_log.txt", "w");
+
+	struct exitDummy
+	{
+		~exitDummy()
+		{
+			fclose(g_LogFile);
+		}
+	} foo;
+
+	AllocConsole();
+	RedirectStdIO();
+	EnableUTF8();
+
+	g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+
 	InitializeCriticalSection(&g_critSec);
 
 	{
@@ -1269,7 +1341,9 @@ int wmain(int argc, wchar_t* argv[])
 		fflush(stdout);
 	}
 
-	g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+
+
+
 
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
 	if(GetConsoleScreenBufferInfo(g_hConsole, &csbi))
@@ -1309,7 +1383,7 @@ int wmain(int argc, wchar_t* argv[])
 
 	StopTraceSession();
 
-	RestoreConsole();
+	FreeConsole();
 
 	free(pSessionProperties);
 

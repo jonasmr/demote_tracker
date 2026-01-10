@@ -61,7 +61,7 @@
       <DisableSpecificWarnings>4189;4101;4201</DisableSpecificWarnings>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>dxgi.lib;tdh.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
@@ -79,7 +79,7 @@
       <DisableSpecificWarnings>4189;4101;4201</DisableSpecificWarnings>
     </ClCompile>
     <Link>
-      <SubSystem>Console</SubSystem>
+      <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -88,6 +88,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="demote_tracker.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="demote_tracker.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
