@@ -182,11 +182,14 @@ struct ProcessMemory
 	}
 };
 
+#define MAX_SEGMENTS 32
 struct Adapter
 {
 	std::wstring name;
 	UINT64		 LocalMemory = 0;
 	PVOID		 pDxgAdapter = 0;
+	UINT64		 SegmentLocalMemory[MAX_SEGMENTS] = {0};
+
 };
 
 static TRACEHANDLE									 g_sessionHandle = 0;
@@ -234,6 +237,15 @@ wstring FindProcName(DWORD pid)
 ProcessMemory* FindProcessMemory(DWORD processId, PVOID pDxgAdapter)
 {
 	return &g_processMemory[ProcessKey{ processId, pDxgAdapter }];
+}
+
+void FreeProcessMemory(DWORD pid)
+{
+	erase_if(g_processMemory, 
+		[pid] (auto& itr)
+		{
+			return itr.first.pid == pid;
+		});
 }
 
 Adapter* FindAdapter(PVOID pDxgAdapter)
@@ -481,6 +493,7 @@ void OnProcessStop(DWORD pid)
 {
 	Process* process = FindProcess(pid);
 	FreeProcess(process);
+	FreeProcessMemory(pid);
 }
 
 void HandleProcessStart(PEVENT_RECORD pEvent)
@@ -667,9 +680,17 @@ void HandleReportSegment(PEVENT_RECORD pEvent)
 
 	Adapter* adapter = FindAdapter(pDxgAdapter);
 	if(MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL)
-		adapter->LocalMemory += Size;
+		adapter->SegmentLocalMemory[ulSegmentId%MAX_SEGMENTS] = Size;
+	else
+		adapter->SegmentLocalMemory[ulSegmentId%MAX_SEGMENTS] = 0;
+	UINT64 Local = 0;
+	for(UINT64 Memory : adapter->SegmentLocalMemory)
+	{
+		Local += Memory;
+	}
+	adapter->LocalMemory = Local;
 
-	fprintf(g_LogFile, "Adapter Segment %ls: %6.fMB / %s\n", adapter->name.c_str(), Size / (1024.f * 1024.f), MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL ? "Local" : "NonLocal");
+	fprintf(g_LogFile, "Adapter Segment %ls/%d: %6.fMB / %s\n", adapter->name.c_str(), ulSegmentId, Size / (1024.f * 1024.f), MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL ? "Local" : "NonLocal");
 	fflush(g_LogFile);
 }
 
@@ -859,22 +880,24 @@ void GetConsoleSize(int& width, int& height)
 
 void FormatMemory(SIZE_T bytes, char* buffer, size_t bufSize)
 {
-	double mb = (double)bytes / (1024.0 * 1024.0);
-	if(mb >= 1024.0)
+	double b = (double)bytes;
+	int x = 0;
+	const char ext[] = {' ', 'K', 'M', 'G', 'T'};
+
+	while(b > 1024 && x+1 < _countof(ext))
 	{
-		sprintf_s(buffer, bufSize, "%6.1f GB", mb / 1024.0);
+		b /= 1024.f;
+		x++;
 	}
-	else
-	{
-		sprintf_s(buffer, bufSize, "%6.0f MB", mb);
-	}
+	sprintf_s(buffer, bufSize, "%6.1f %cB", b, ext[x]);
 }
 
 static void NextLine()
 {
 	g_currentX = 0;
 	g_currentY++;
-};
+}
+
 static void Put(char c)
 {
 	if(g_currentX < g_consoleWidth)
@@ -887,7 +910,8 @@ static void Put(char c)
 		}
 		g_currentX += 1;
 	}
-};
+}
+
 template <typename... Args>
 static void PutFormat(const char* fmt, Args&&... args) /// wtf is going on with c++
 {
@@ -909,7 +933,7 @@ static void PutFormat(const char* fmt, Args&&... args) /// wtf is going on with 
 			i++;
 		}
 	}
-};
+}
 
 void DrawMemoryBar(const ProcessMemory* process, SIZE_T maxMemoryBytes, int barWidth)
 {
@@ -1103,6 +1127,8 @@ void ConsoleUpdate()
 		if(i < displayCount)
 		{
 			const ProcessMemory* procMem = processes[i];
+			if(procMem->CommitmentLocal == 0 && procMem->UsageLocal == 0)
+				continue;
 			Process*			 proc	 = FindProcess(procMem->pid);
 			if(proc->imageFilename.length() == 0)
 			{
