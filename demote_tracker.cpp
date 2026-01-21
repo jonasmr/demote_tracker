@@ -12,7 +12,6 @@
 #include <mutex>
 #include <conio.h>
 
-
 #include <io.h>
 #include <shellapi.h>
 #include <fcntl.h>
@@ -126,12 +125,14 @@ enum Prio
 struct Process
 {
 	DWORD	pid;
+	bool	isTracked = false;
 	wstring imageFilename;
 	wstring imagePath;
 	int		nextFree = -1;
 	void	Reset()
 	{
 		pid			  = (DWORD)-1;
+		isTracked	  = false;
 		imageFilename = L"";
 		imagePath	  = L"";
 	}
@@ -165,6 +166,7 @@ struct ProcessMemory
 {
 	DWORD pid;
 	PVOID pDxgAdapter;
+	bool  isTracked;
 
 	UINT64 CommitmentLocal;
 	UINT64 CommitmentNonLocal;
@@ -186,10 +188,9 @@ struct ProcessMemory
 struct Adapter
 {
 	std::wstring name;
-	UINT64		 LocalMemory = 0;
-	PVOID		 pDxgAdapter = 0;
-	UINT64		 SegmentLocalMemory[MAX_SEGMENTS] = {0};
-
+	UINT64		 LocalMemory					  = 0;
+	PVOID		 pDxgAdapter					  = 0;
+	UINT64		 SegmentLocalMemory[MAX_SEGMENTS] = { 0 };
 };
 
 static TRACEHANDLE									 g_sessionHandle = 0;
@@ -201,7 +202,8 @@ static int											 g_processFirstFree = -1;
 static std::unordered_map<DWORD, int>				 g_pidToProcess;
 static std::unordered_map<ProcessKey, ProcessMemory> g_processMemory;
 static std::unordered_map<PVOID, Adapter>			 g_adapters;
-static bool g_verbose = false;
+static std::vector<wstring>							 g_trackedProcesses;
+static bool											 g_verbose = false;
 
 // Console Stuff
 static HANDLE				  g_hConsole		   = NULL;
@@ -221,8 +223,9 @@ static const char* g_prioNames[6]	  = { "?", "MIN", "LOW", "NORMAL", "HIGH", "MA
 static int		   g_adapterToColor[] = { YELLOW, WHITE, MAGENTA, RED, CYAN, WHITE, BLUE, GREEN };
 static int		   g_numAdapterColors = sizeof(g_adapterToColor) / sizeof(g_adapterToColor[0]);
 
-
 static FILE* g_LogFile = nullptr;
+
+Process* FindProcess(DWORD pid);
 
 wstring FindProcName(DWORD pid)
 {
@@ -236,16 +239,19 @@ wstring FindProcName(DWORD pid)
 }
 ProcessMemory* FindProcessMemory(DWORD processId, PVOID pDxgAdapter)
 {
-	return &g_processMemory[ProcessKey{ processId, pDxgAdapter }];
+	ProcessKey Key = { processId, pDxgAdapter };
+	auto	   itr = g_processMemory.find(Key);
+	if(itr != g_processMemory.end())
+		return &(*itr).second;
+
+	ProcessMemory* mem = &g_processMemory[Key];
+	mem->isTracked	   = FindProcess(processId)->isTracked;
+	return mem;
 }
 
 void FreeProcessMemory(DWORD pid)
 {
-	erase_if(g_processMemory, 
-		[pid] (auto& itr)
-		{
-			return itr.first.pid == pid;
-		});
+	erase_if(g_processMemory, [pid](auto& itr) { return itr.first.pid == pid; });
 }
 
 Adapter* FindAdapter(PVOID pDxgAdapter)
@@ -481,6 +487,16 @@ const wchar_t* GetPropertyOffset(PTRACE_EVENT_INFO pInfo, const wchar_t* searchP
 	return 0;
 }
 
+bool ProcessCheckTracked(const wstring& path)
+{
+	for(const wstring& tracked : g_trackedProcesses)
+	{
+		if(std::wcsstr(path.c_str(), tracked.c_str()))
+			return true;
+	}
+	return false;
+}
+
 void OnProcessCreate(wstring imageName, DWORD processId, bool isRundown)
 {
 	(void)isRundown;
@@ -488,6 +504,7 @@ void OnProcessCreate(wstring imageName, DWORD processId, bool isRundown)
 	Process*	 process   = FindProcess(processId);
 	process->imageFilename = fileName;
 	process->imagePath	   = imageName;
+	process->isTracked	   = ProcessCheckTracked(imageName);
 }
 void OnProcessStop(DWORD pid)
 {
@@ -680,9 +697,9 @@ void HandleReportSegment(PEVENT_RECORD pEvent)
 
 	Adapter* adapter = FindAdapter(pDxgAdapter);
 	if(MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL)
-		adapter->SegmentLocalMemory[ulSegmentId%MAX_SEGMENTS] = Size;
+		adapter->SegmentLocalMemory[ulSegmentId % MAX_SEGMENTS] = Size;
 	else
-		adapter->SegmentLocalMemory[ulSegmentId%MAX_SEGMENTS] = 0;
+		adapter->SegmentLocalMemory[ulSegmentId % MAX_SEGMENTS] = 0;
 	UINT64 Local = 0;
 	for(UINT64 Memory : adapter->SegmentLocalMemory)
 	{
@@ -690,7 +707,12 @@ void HandleReportSegment(PEVENT_RECORD pEvent)
 	}
 	adapter->LocalMemory = Local;
 
-	fprintf(g_LogFile, "Adapter Segment %ls/%d: %6.fMB / %s\n", adapter->name.c_str(), ulSegmentId, Size / (1024.f * 1024.f), MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL ? "Local" : "NonLocal");
+	fprintf(g_LogFile,
+			"Adapter Segment %ls/%d: %6.fMB / %s\n",
+			adapter->name.c_str(),
+			ulSegmentId,
+			Size / (1024.f * 1024.f),
+			MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL ? "Local" : "NonLocal");
 	fflush(g_LogFile);
 }
 
@@ -880,11 +902,11 @@ void GetConsoleSize(int& width, int& height)
 
 void FormatMemory(SIZE_T bytes, char* buffer, size_t bufSize)
 {
-	double b = (double)bytes;
-	int x = 0;
-	const char ext[] = {' ', 'K', 'M', 'G', 'T'};
+	double	   b	 = (double)bytes;
+	int		   x	 = 0;
+	const char ext[] = { ' ', 'K', 'M', 'G', 'T' };
 
-	while(b > 1024 && x+1 < _countof(ext))
+	while(b > 1024 && x + 1 < _countof(ext))
 	{
 		b /= 1024.f;
 		x++;
@@ -902,7 +924,7 @@ static void Put(char c)
 {
 	if(g_currentX < g_consoleWidth)
 	{
-		int idx						   = g_currentY * g_consoleWidth + g_currentX;
+		int idx = g_currentY * g_consoleWidth + g_currentX;
 		if(idx < g_chars.size())
 		{
 			g_chars.at(idx).Char.AsciiChar = c;
@@ -923,7 +945,7 @@ static void PutFormat(const char* fmt, Args&&... args) /// wtf is going on with 
 		int i	 = 0;
 		while(i < r && g_currentX < g_consoleWidth)
 		{
-			int idx						   = base + g_currentX;
+			int idx = base + g_currentX;
 			if(idx < g_chars.size())
 			{
 				g_chars.at(idx).Char.AsciiChar = buffer[i];
@@ -1024,7 +1046,18 @@ void ConsoleUpdate()
 		processes.push_back(&mem);
 		maxUsage = mem.UsageLocal > maxUsage ? mem.UsageLocal : maxUsage;
 	}
-	std::sort(processes.begin(), processes.end(), [](const ProcessMemory* a, const ProcessMemory* b) { return a->UsageLocal > b->UsageLocal; });
+	std::sort(processes.begin(),
+			  processes.end(),
+			  [](const ProcessMemory* a, const ProcessMemory* b)
+
+			  {
+				  bool aTracked = a->isTracked;
+				  bool bTracked = b->isTracked;
+				  if(aTracked == bTracked)
+					  return a->UsageLocal > b->UsageLocal;
+				  else
+					  return (aTracked > bTracked);
+			  });
 
 	GetConsoleSize(g_consoleWidth, g_consoleHeight);
 
@@ -1129,11 +1162,12 @@ void ConsoleUpdate()
 			const ProcessMemory* procMem = processes[i];
 			if(procMem->CommitmentLocal == 0 && procMem->UsageLocal == 0)
 				continue;
-			Process*			 proc	 = FindProcess(procMem->pid);
+			Process* proc = FindProcess(procMem->pid);
 			if(proc->imageFilename.length() == 0)
 			{
 				proc->imagePath		= GetProcessName(procMem->pid);
 				proc->imageFilename = GetFileName(proc->imagePath);
+				proc->isTracked		= ProcessCheckTracked(proc->imagePath);
 			}
 			char nameBuffer[64] = {};
 			WideCharToMultiByte(CP_ACP, 0, proc->imageFilename.c_str(), -1, nameBuffer, sizeof(nameBuffer) - 1, NULL, NULL);
@@ -1148,7 +1182,10 @@ void ConsoleUpdate()
 			}
 
 			g_currentColor = GetAdapterColor(procMem->pDxgAdapter);
-			PutFormat("%-*s", nameWidth, nameBuffer);
+			if(procMem->isTracked)
+				PutFormat("*%-*s", nameWidth - 1, nameBuffer);
+			else
+				PutFormat("%-*s", nameWidth, nameBuffer);
 
 			char memBuffer[32];
 			FormatMemory(procMem->UsageLocal, memBuffer, sizeof(memBuffer));
@@ -1191,8 +1228,6 @@ void ConsoleUpdate()
 	g_currentColor = (WHITE);
 }
 
-
-
 static void EnableUTF8()
 {
 	SetConsoleOutputCP(CP_UTF8);
@@ -1223,8 +1258,11 @@ void ParseCommandLine()
 			g_verbose = true;
 			break;
 		}
+		else if(argv[i][0] != L'-')
+		{
+			g_trackedProcesses.push_back(argv[i]);
+		}
 	}
-
 }
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
@@ -1366,10 +1404,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 		wprintf(L"Capture state requested successfully.\n");
 		fflush(stdout);
 	}
-
-
-
-
 
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
 	if(GetConsoleScreenBufferInfo(g_hConsole, &csbi))
