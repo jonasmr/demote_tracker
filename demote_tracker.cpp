@@ -1090,7 +1090,19 @@ void ConsoleUpdate()
 		nameWidth = 15;
 	}
 
-	int fixedWidth = nameWidth + 2 + 3 * memoryWidth + 2 + 2;
+	bool showAllDemoted = false;
+
+
+
+	int fixedWidth = nameWidth + 3 * (1+memoryWidth)-1;
+	int fixedWidthAll = nameWidth + (3+4) * (1+memoryWidth) -1;
+
+	if(fixedWidthAll + 15 < g_consoleWidth)
+	{
+		showAllDemoted = true;
+		fixedWidth = fixedWidthAll;
+	}
+	
 	int barWidth   = g_consoleWidth - fixedWidth;
 
 	if(barWidth < 10)
@@ -1170,7 +1182,13 @@ void ConsoleUpdate()
 				proc->isTracked		= ProcessCheckTracked(proc->imagePath);
 			}
 			char nameBuffer[64] = {};
-			WideCharToMultiByte(CP_ACP, 0, proc->imageFilename.c_str(), -1, nameBuffer, sizeof(nameBuffer) - 1, NULL, NULL);
+			if(proc->isTracked)
+			{
+				nameBuffer[0] = '*';
+				WideCharToMultiByte(CP_ACP, 0, proc->imageFilename.c_str(), -1, nameBuffer + 1, sizeof(nameBuffer) - 2, NULL, NULL);
+			}
+			else
+				WideCharToMultiByte(CP_ACP, 0, proc->imageFilename.c_str(), -1, nameBuffer, sizeof(nameBuffer) - 1, NULL, NULL);
 
 			// Truncate if needed
 			if((int)strlen(nameBuffer) > nameWidth - 1)
@@ -1182,34 +1200,46 @@ void ConsoleUpdate()
 			}
 
 			g_currentColor = GetAdapterColor(procMem->pDxgAdapter);
-			if(procMem->isTracked)
-				PutFormat("*%-*s", nameWidth - 1, nameBuffer);
-			else
-				PutFormat("%-*s", nameWidth, nameBuffer);
+			PutFormat("%-*s", nameWidth, nameBuffer);
 
 			char memBuffer[32];
 			FormatMemory(procMem->UsageLocal, memBuffer, sizeof(memBuffer));
 			g_currentColor = CYAN;
-			PutFormat("  %*s", memoryWidth, memBuffer);
+			PutFormat(" %*s", memoryWidth, memBuffer);
 
 			FormatMemory(procMem->CommitmentLocal, memBuffer, sizeof(memBuffer));
 			g_currentColor = CYAN;
-			PutFormat("  %*s", memoryWidth, memBuffer);
-			UINT64 DemotedSum	  = 0;
-			int	   prioColorIndex = 0;
-			int	   idx			  = 0;
-			for(UINT64 dem : procMem->CommitmentDemoted)
+			PutFormat(" %*s", memoryWidth, memBuffer);
+
+			if(showAllDemoted)
 			{
-				if(dem)
-					prioColorIndex = idx + 1;
-				DemotedSum += dem;
-				idx++;
+				int idx = 0;
+				for(UINT64 dem : procMem->CommitmentDemoted)
+				{
+					FormatMemory(dem, memBuffer, sizeof(memBuffer));
+					g_currentColor = (g_PrioTocolor[idx + 1]);
+					PutFormat(" %*s", memoryWidth, memBuffer);
+					idx++;
+				}
 			}
+			else
+			{
+				UINT64 DemotedSum	  = 0;
+				int	   prioColorIndex = 0;
+				int	   idx			  = 0;
+				for(UINT64 dem : procMem->CommitmentDemoted)
+				{
+					if(dem)
+						prioColorIndex = idx + 1;
+					DemotedSum += dem;
+					idx++;
+				}
 
-			FormatMemory(DemotedSum, memBuffer, sizeof(memBuffer));
-			g_currentColor = (g_PrioTocolor[prioColorIndex]);
-			PutFormat("  %*s  ", memoryWidth, memBuffer);
-
+				FormatMemory(DemotedSum, memBuffer, sizeof(memBuffer));
+				g_currentColor = (g_PrioTocolor[prioColorIndex]);
+				PutFormat(" %*s", memoryWidth, memBuffer);
+			}
+			Put(' ');
 			DrawMemoryBar(procMem, maxUsage, barWidth - 5);
 			g_currentColor = (WHITE);
 		}
@@ -1220,6 +1250,8 @@ void ConsoleUpdate()
 		NextLine();
 	}
 	g_currentColor = (DARK_GRAY);
+	g_currentY	   = g_consoleHeight - 1;
+
 	PutFormat("Refreshing... (Esc to exit)");
 	for(int i = g_currentX; i < g_consoleWidth - 1; i++)
 		Put(' ');
