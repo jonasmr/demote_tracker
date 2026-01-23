@@ -203,10 +203,15 @@ static std::unordered_map<DWORD, int>				 g_pidToProcess;
 static std::unordered_map<ProcessKey, ProcessMemory> g_processMemory;
 static std::unordered_map<PVOID, Adapter>			 g_adapters;
 static std::vector<wstring>							 g_trackedProcesses;
-static bool											 g_verbose = false;
+static bool											 g_verbose			 = false;
+static bool											 g_detailedMode		 = false;
+static int											 g_minSize			 = 0;
+static bool											 g_detailedAvailable = false;
+static HANDLE										 g_hRedrawEvent;
 
 // Console Stuff
-static HANDLE				  g_hConsole		   = NULL;
+static HANDLE				  g_hConsoleOutput	   = NULL;
+static HANDLE				  g_hConsoleInput	   = NULL;
 static int					  g_consoleWidth	   = 80;
 static int					  g_consoleHeight	   = 80;
 static WORD					  g_originalAttributes = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
@@ -849,17 +854,17 @@ BOOL WINAPI ConsoleHandler(DWORD ctrlType)
 void HideCursor()
 {
 	CONSOLE_CURSOR_INFO cursorInfo;
-	GetConsoleCursorInfo(g_hConsole, &cursorInfo);
+	GetConsoleCursorInfo(g_hConsoleOutput, &cursorInfo);
 	cursorInfo.bVisible = FALSE;
-	SetConsoleCursorInfo(g_hConsole, &cursorInfo);
+	SetConsoleCursorInfo(g_hConsoleOutput, &cursorInfo);
 }
 
 void ShowCursor()
 {
 	CONSOLE_CURSOR_INFO cursorInfo;
-	GetConsoleCursorInfo(g_hConsole, &cursorInfo);
+	GetConsoleCursorInfo(g_hConsoleOutput, &cursorInfo);
 	cursorInfo.bVisible = TRUE;
-	SetConsoleCursorInfo(g_hConsole, &cursorInfo);
+	SetConsoleCursorInfo(g_hConsoleOutput, &cursorInfo);
 }
 
 void ClearScreen()
@@ -869,26 +874,26 @@ void ClearScreen()
 	DWORD					   cellCount;
 	COORD					   homeCoords = { 0, 0 };
 
-	if(!GetConsoleScreenBufferInfo(g_hConsole, &csbi))
+	if(!GetConsoleScreenBufferInfo(g_hConsoleOutput, &csbi))
 		return;
 	cellCount = csbi.dwSize.X * csbi.dwSize.Y;
 
-	FillConsoleOutputCharacter(g_hConsole, ' ', cellCount, homeCoords, &count);
-	FillConsoleOutputAttribute(g_hConsole, g_originalAttributes, cellCount, homeCoords, &count);
-	SetConsoleCursorPosition(g_hConsole, homeCoords);
+	FillConsoleOutputCharacter(g_hConsoleOutput, ' ', cellCount, homeCoords, &count);
+	FillConsoleOutputAttribute(g_hConsoleOutput, g_originalAttributes, cellCount, homeCoords, &count);
+	SetConsoleCursorPosition(g_hConsoleOutput, homeCoords);
 }
 
 void RestoreConsole()
 {
 	ClearScreen();
-	SetConsoleTextAttribute(g_hConsole, g_originalAttributes);
+	SetConsoleTextAttribute(g_hConsoleOutput, g_originalAttributes);
 	ShowCursor();
 }
 
 void GetConsoleSize(int& width, int& height)
 {
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
-	if(GetConsoleScreenBufferInfo(g_hConsole, &csbi))
+	if(GetConsoleScreenBufferInfo(g_hConsoleOutput, &csbi))
 	{
 		width  = csbi.srWindow.Right - csbi.srWindow.Left + 1;
 		height = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
@@ -904,6 +909,11 @@ void FormatMemory(SIZE_T bytes, char* buffer, size_t bufSize)
 {
 	double	   b	 = (double)bytes;
 	int		   x	 = 0;
+	for(int i = 0; i < g_minSize; ++i)
+	{
+		b /= 1024.f;
+		x++;
+	}
 	const char ext[] = { ' ', 'K', 'M', 'G', 'T' };
 
 	while(b > 1024 && x + 1 < _countof(ext))
@@ -1090,20 +1100,18 @@ void ConsoleUpdate()
 		nameWidth = 15;
 	}
 
-	bool showAllDemoted = false;
+	bool showDetailed = false;
 
-
-
-	int fixedWidth = nameWidth + 3 * (1+memoryWidth)-1;
-	int fixedWidthAll = nameWidth + (3+4) * (1+memoryWidth) -1;
-
-	if(fixedWidthAll + 15 < g_consoleWidth)
+	int fixedWidth		= nameWidth + 3 * (1 + memoryWidth) - 1;
+	int fixedWidthAll	= nameWidth + (3 + 4) * (1 + memoryWidth) - 1;
+	g_detailedAvailable = fixedWidthAll + 15 < g_consoleWidth;
+	if(g_detailedAvailable && g_detailedMode)
 	{
-		showAllDemoted = true;
-		fixedWidth = fixedWidthAll;
+		showDetailed = true;
+		fixedWidth	   = fixedWidthAll;
 	}
-	
-	int barWidth   = g_consoleWidth - fixedWidth;
+
+	int barWidth = g_consoleWidth - fixedWidth;
 
 	if(barWidth < 10)
 		barWidth = 10;
@@ -1142,31 +1150,44 @@ void ConsoleUpdate()
 		PutFormat("[%ls (%.1fGB)] ", a->name.c_str(), a->LocalMemory / (1024.0 * 1024.0 * 1024.0));
 	}
 	NextLine();
+	auto WritePrios = []()
+	{
+		PutFormat("[");
+		for(int i = 0; i < 5; ++i)
+		{
+			g_currentColor = g_PrioTocolor[i + 1];
+			if(i != 4)
+				PutFormat("%s ", g_prioNames[i + 1]);
+			else
+			{
+				PutFormat("%s", g_prioNames[i + 1]);
+				g_currentColor = (CYAN);
+				Put(']');
+			}
+		}
+	};
+
 	g_currentColor = CYAN;
-	PutFormat("%-*s  %*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth, "Usage", memoryWidth, "Commit", memoryWidth, "Demoted");
+	PutFormat("%-*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth-1, "Usage", memoryWidth-1, "Commit");
+	PutFormat("%*s  ", memoryWidth-1, "Demoted");
+	if(showDetailed)
+	{
+		WritePrios();
+		int lim = g_consoleWidth - barWidth;
+		while(g_currentX++ < lim + 2)
+			;
+	}
 	g_currentColor = GREEN;
 	PutFormat("Present ");
 	g_currentColor = CYAN;
-	PutFormat("Demoted[");
-	for(int i = 0; i < 5; ++i)
-	{
-		g_currentColor = g_PrioTocolor[i + 1];
-		if(i != 4)
-			PutFormat("%s ", g_prioNames[i + 1]);
-		else
-		{
-			PutFormat("%s", g_prioNames[i + 1]);
-			g_currentColor = (CYAN);
-			Put(']');
-		}
-	}
+	PutFormat("Demoted");
+	WritePrios();
 	NextLine();
 
 	g_currentColor = DARK_GRAY;
 	for(int i = 0; i < g_consoleWidth; i++)
 		Put('-');
 	NextLine();
-
 	for(int i = 0; i < maxProcesses; i++)
 	{
 		if(i < displayCount)
@@ -1211,13 +1232,21 @@ void ConsoleUpdate()
 			g_currentColor = CYAN;
 			PutFormat(" %*s", memoryWidth, memBuffer);
 
-			if(showAllDemoted)
+			
+			if(showDetailed)
 			{
 				int idx = 0;
 				for(UINT64 dem : procMem->CommitmentDemoted)
 				{
 					FormatMemory(dem, memBuffer, sizeof(memBuffer));
-					g_currentColor = (g_PrioTocolor[idx + 1]);
+					if(dem)
+					{
+						g_currentColor = (g_PrioTocolor[idx + 1]);
+					}
+					else
+					{
+						g_currentColor = DARK_GRAY;
+					}
 					PutFormat(" %*s", memoryWidth, memBuffer);
 					idx++;
 				}
@@ -1252,30 +1281,17 @@ void ConsoleUpdate()
 	g_currentColor = (DARK_GRAY);
 	g_currentY	   = g_consoleHeight - 1;
 
-	PutFormat("Refreshing... (Esc to exit)");
+	PutFormat("Refreshing... [Esc:exit");
+	if(g_detailedAvailable)
+		PutFormat(" Space:detailed ");
+
+	PutFormat(" bmkg:bytes]");
+
 	for(int i = g_currentX; i < g_consoleWidth - 1; i++)
 		Put(' ');
 	SMALL_RECT r{ 0, 0, (SHORT)g_consoleWidth, (SHORT)g_consoleHeight };
-	WriteConsoleOutputA(g_hConsole, &g_chars[0], { (SHORT)g_consoleWidth, (SHORT)g_consoleHeight }, { 0, 0 }, &r);
+	WriteConsoleOutputA(g_hConsoleOutput, &g_chars[0], { (SHORT)g_consoleWidth, (SHORT)g_consoleHeight }, { 0, 0 }, &r);
 	g_currentColor = (WHITE);
-}
-
-static void EnableUTF8()
-{
-	SetConsoleOutputCP(CP_UTF8);
-	SetConsoleCP(CP_UTF8);
-
-	_setmode(_fileno(stdout), _O_U8TEXT);
-	_setmode(_fileno(stderr), _O_U8TEXT);
-	_setmode(_fileno(stdin), _O_U8TEXT);
-}
-
-static void RedirectStdIO()
-{
-	FILE* fp;
-	freopen_s(&fp, "CONOUT$", "w", stdout);
-	freopen_s(&fp, "CONOUT$", "w", stderr);
-	freopen_s(&fp, "CONIN$", "r", stdin);
 }
 
 void ParseCommandLine()
@@ -1301,6 +1317,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	ParseCommandLine();
 	fopen_s(&g_LogFile, "demote_tracker_log.txt", "w");
 
+	g_hRedrawEvent = CreateEvent(NULL, FALSE, FALSE, L"ConsoleRedrawEvent");
+
 	struct exitDummy
 	{
 		~exitDummy()
@@ -1310,10 +1328,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	} foo;
 
 	AllocConsole();
-	RedirectStdIO();
-	EnableUTF8();
 
-	g_hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+	g_hConsoleInput	 = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	g_hConsoleOutput = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	SetConsoleOutputCP(CP_UTF8);
+	SetConsoleCP(CP_UTF8);
 
 	InitializeCriticalSection(&g_critSec);
 
@@ -1438,7 +1457,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	}
 
 	CONSOLE_SCREEN_BUFFER_INFO csbi;
-	if(GetConsoleScreenBufferInfo(g_hConsole, &csbi))
+	if(GetConsoleScreenBufferInfo(g_hConsoleOutput, &csbi))
 	{
 		g_originalAttributes = csbi.wAttributes;
 	}
@@ -1451,16 +1470,47 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 
 	while(1)
 	{
-		if(_kbhit())
+		do
 		{
-			int ch = _getch();
-			if(ch == 27)
-			{
-				StopTraceSession();
-				wprintf(L"\nStopping trace...\n");
-				fflush(stdout);
+			INPUT_RECORD Record, Record0;
+			DWORD		 Length;
+
+			auto r = PeekConsoleInput(g_hConsoleInput, &Record, 1, &Length);
+			if(!r || Length == 0)
+				break;
+			ReadConsoleInput(g_hConsoleInput, &Record, 1, &Length);
+			WORD ch = Record.Event.KeyEvent.wVirtualKeyCode;
+			if(Record.Event.KeyEvent.bKeyDown && ch != 0)
+			{				
+				if(ch == 'G')
+				{
+					g_minSize = g_minSize == 3 ? 0 : 3;
+				}
+				else if(ch == 'M')
+				{
+					g_minSize = g_minSize == 2 ? 0 : 2;
+				}
+				else if(ch == 'K')
+				{
+					g_minSize = g_minSize == 1 ? 0 : 1;
+				}
+				else if(ch == 'B')
+				{
+					g_minSize = 0;
+				}
+				else if(ch == 0x20)
+				{
+					g_detailedMode = !g_detailedMode;
+				}
+				if(ch == 27)
+				{
+					StopTraceSession();
+					wprintf(L"\nStopping trace...\n");
+					fflush(stdout);
+				}
 			}
-		}
+
+		} while(1);
 		if(g_sessionHandle == 0)
 		{
 			wprintf(L"Exit detected.\n");
@@ -1468,7 +1518,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 			break;
 		}
 		ConsoleUpdate();
-		Sleep(1000);
+		HANDLE handles[] = { g_hRedrawEvent, g_hConsoleInput };
+		WaitForMultipleObjects(2, handles, FALSE, 1000);
 	}
 
 	traceThread.join();
