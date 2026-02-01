@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <unordered_map>
+#include <vector>
 #include <mutex>
 #include <conio.h>
 
@@ -78,6 +79,11 @@ enum DxgKrnlEventIds
 	RecycleRangeTracking_Info1 = 301,
 	RecycleRangeTracking_Info2 = 302,
 	RecycleRangeTracking_Info3 = 303,
+
+	PagingOpVirtualTransfer = 306,
+	PagingOpNotifyResidency = 312,
+	PagingOpSysmemCommit	= 313,
+	PagingOpSysmemUncommit	= 314,
 
 	// VidMm events (keyword: References 0x4)
 	VidMmMakeResident = 320,
@@ -229,6 +235,11 @@ static int		   g_adapterToColor[] = { YELLOW, WHITE, MAGENTA, RED, CYAN, WHITE, 
 static int		   g_numAdapterColors = sizeof(g_adapterToColor) / sizeof(g_adapterToColor[0]);
 
 static FILE* g_LogFile = nullptr;
+
+// #include <windows.h>
+// #include <stdarg.h>
+// #include <stdio.h>
+static void dprintf(LPVOID pid, const char* fmt, ...);
 
 Process* FindProcess(DWORD pid);
 
@@ -562,9 +573,383 @@ void HandleProcessEvent(PEVENT_RECORD pEvent)
 	}
 }
 
+struct GlobalAllocDescription
+{
+	PVOID			   VidMmGlobal;
+	PVOID			   ProcessId;
+	PVOID			   pDxgAdapter;
+	UINT64			   Size;
+	UINT32			   CommittedSegments;
+	UINT32			   PreferredSegment;
+	UINT32			   EvictedSegment;
+	std::vector<PVOID> Allocs;
+};
+
+static std::unordered_map<PVOID, GlobalAllocDescription> g_GlobalAlloc;
+static std::unordered_map<PVOID, PVOID>					 g_AllocToGlobal;
+
+bool IsTracked(GlobalAllocDescription* al)
+{
+	PVOID	 pid  = al->ProcessId;
+	Process* proc = FindProcess((DWORD)(INT64)pid);
+	return proc->isTracked;
+}
+
+GlobalAllocDescription* FindOrAddGlobal(PVOID VidMmGlobal)
+{
+	auto itr = g_GlobalAlloc.find(VidMmGlobal);
+	if(itr != g_GlobalAlloc.end())
+	{
+		return &(*itr).second;
+	}
+	return &g_GlobalAlloc[VidMmGlobal];
+}
+void RemoveGlobalAlloc(PVOID VidMmGlobal)
+{
+	auto itr = g_GlobalAlloc.find(VidMmGlobal);
+	if(itr != g_GlobalAlloc.end())
+	{
+		g_GlobalAlloc.erase(itr);
+	}
+}
+void HandleAdapterAllocationStart(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* prophProcessId			= GetPropertyOffset(pInfo, L"hProcessId");
+	static const wchar_t* prophDevice				= GetPropertyOffset(pInfo, L"hDevice");
+	static const wchar_t* proppDxgAdapter			= GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* propFlags					= GetPropertyOffset(pInfo, L"Flags");
+	static const wchar_t* propallocSize				= GetPropertyOffset(pInfo, L"allocSize");
+	static const wchar_t* propulAlignment			= GetPropertyOffset(pInfo, L"ulAlignment");
+	static const wchar_t* propdwReadSegment			= GetPropertyOffset(pInfo, L"dwReadSegment");
+	static const wchar_t* propdwWriteSegment		= GetPropertyOffset(pInfo, L"dwWriteSegment");
+	static const wchar_t* propPreferredSegment		= GetPropertyOffset(pInfo, L"PreferredSegment");
+	static const wchar_t* propHintedBank			= GetPropertyOffset(pInfo, L"HintedBank");
+	static const wchar_t* propdwEvictionSegment		= GetPropertyOffset(pInfo, L"dwEvictionSegment");
+	static const wchar_t* propPriority				= GetPropertyOffset(pInfo, L"Priority");
+	static const wchar_t* prophVidMmGlobalAlloc		= GetPropertyOffset(pInfo, L"hVidMmGlobalAlloc");
+	static const wchar_t* prophDxgGlobalAlloc		= GetPropertyOffset(pInfo, L"hDxgGlobalAlloc");
+	static const wchar_t* prophDxgSharedResource	= GetPropertyOffset(pInfo, L"hDxgSharedResource");
+	static const wchar_t* propUsageVersion			= GetPropertyOffset(pInfo, L"UsageVersion");
+	static const wchar_t* propUsageFlags			= GetPropertyOffset(pInfo, L"UsageFlags");
+	static const wchar_t* propFormat				= GetPropertyOffset(pInfo, L"Format");
+	static const wchar_t* propSwizzledFormat		= GetPropertyOffset(pInfo, L"SwizzledFormat");
+	static const wchar_t* propByteOffset			= GetPropertyOffset(pInfo, L"ByteOffset");
+	static const wchar_t* propWidth					= GetPropertyOffset(pInfo, L"Width");
+	static const wchar_t* propHeight				= GetPropertyOffset(pInfo, L"Height");
+	static const wchar_t* propPitch					= GetPropertyOffset(pInfo, L"Pitch");
+	static const wchar_t* propDepth					= GetPropertyOffset(pInfo, L"Depth");
+	static const wchar_t* propSlicePitch			= GetPropertyOffset(pInfo, L"SlicePitch");
+	static const wchar_t* propBackingStoreWasPinned = GetPropertyOffset(pInfo, L"BackingStoreWasPinned");
+	static const wchar_t* proppSectionObject		= GetPropertyOffset(pInfo, L"pSectionObject");
+	static const wchar_t* propPhysicalAdapterIndex	= GetPropertyOffset(pInfo, L"PhysicalAdapterIndex");
+	static const wchar_t* propPageTableOrDirectory	= GetPropertyOffset(pInfo, L"PageTableOrDirectory");
+
+	PVOID  hProcessId		  = GetProperty<PVOID>(pEvent, prophProcessId);
+	PVOID  hDevice			  = GetProperty<PVOID>(pEvent, prophDevice);
+	PVOID  pDxgAdapter		  = GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	UINT32 Flags			  = GetProperty<UINT32>(pEvent, propFlags);
+	UINT64 allocSize		  = GetProperty<UINT64>(pEvent, propallocSize);
+	UINT32 ulAlignment		  = GetProperty<UINT32>(pEvent, propulAlignment);
+	UINT32 dwReadSegment	  = GetProperty<UINT32>(pEvent, propdwReadSegment);
+	UINT32 dwWriteSegment	  = GetProperty<UINT32>(pEvent, propdwWriteSegment);
+	UINT32 PreferredSegment	  = GetProperty<UINT32>(pEvent, propPreferredSegment);
+	UINT32 HintedBank		  = GetProperty<UINT32>(pEvent, propHintedBank);
+	UINT32 dwEvictionSegment  = GetProperty<UINT32>(pEvent, propdwEvictionSegment);
+	UINT32 Priority			  = GetProperty<UINT32>(pEvent, propPriority);
+	PVOID  hVidMmGlobalAlloc  = GetProperty<PVOID>(pEvent, prophVidMmGlobalAlloc);
+	PVOID  hDxgGlobalAlloc	  = GetProperty<PVOID>(pEvent, prophDxgGlobalAlloc);
+	PVOID  hDxgSharedResource = GetProperty<PVOID>(pEvent, prophDxgSharedResource);
+	UINT32 UsageVersion		  = GetProperty<UINT32>(pEvent, propUsageVersion);
+	UINT32 UsageFlags		  = GetProperty<UINT32>(pEvent, propUsageFlags);
+	UINT32 Format			  = GetProperty<UINT32>(pEvent, propFormat);
+	UINT32 SwizzledFormat	  = GetProperty<UINT32>(pEvent, propSwizzledFormat);
+	UINT32 ByteOffset		  = GetProperty<UINT32>(pEvent, propByteOffset);
+	UINT32 Width			  = GetProperty<UINT32>(pEvent, propWidth);
+	UINT32 Height			  = GetProperty<UINT32>(pEvent, propHeight);
+	UINT32 Pitch			  = GetProperty<UINT32>(pEvent, propPitch);
+	UINT32 Depth			  = GetProperty<UINT32>(pEvent, propDepth);
+	UINT32 SlicePitch		  = GetProperty<UINT32>(pEvent, propSlicePitch);
+	// BOOLEAN BackingStoreWasPinned = GetProperty<BOOLEAN>(pEvent, propBackingStoreWasPinned);
+	// PVOID	pSectionObject		  = GetProperty<PVOID>(pEvent, proppSectionObject);
+	// UINT16	PhysicalAdapterIndex  = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
+	// BOOLEAN PageTableOrDirectory  = GetProperty<BOOLEAN>(pEvent, propPageTableOrDirectory);
+
+	GlobalAllocDescription* pGlobal = FindOrAddGlobal(hVidMmGlobalAlloc);
+
+	pGlobal->VidMmGlobal	   = hVidMmGlobalAlloc;
+	pGlobal->ProcessId		   = hProcessId;
+	pGlobal->pDxgAdapter	   = pDxgAdapter;
+	pGlobal->Size			   = allocSize;
+	pGlobal->CommittedSegments = 0;
+	pGlobal->PreferredSegment  = PreferredSegment;
+	pGlobal->EvictedSegment	   = dwEvictionSegment;
+	dprintf(hProcessId, "ADAPTER_ALLOC %p / %8.5fKB\n", hVidMmGlobalAlloc, (float)allocSize / (1024.f));
+}
+
+void HandleAdapterAllocationStop(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* prophProcessId			= GetPropertyOffset(pInfo, L"hProcessId");
+	static const wchar_t* prophDevice				= GetPropertyOffset(pInfo, L"hDevice");
+	static const wchar_t* proppDxgAdapter			= GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* propFlags					= GetPropertyOffset(pInfo, L"Flags");
+	static const wchar_t* propallocSize				= GetPropertyOffset(pInfo, L"allocSize");
+	static const wchar_t* propulAlignment			= GetPropertyOffset(pInfo, L"ulAlignment");
+	static const wchar_t* propdwReadSegment			= GetPropertyOffset(pInfo, L"dwReadSegment");
+	static const wchar_t* propdwWriteSegment		= GetPropertyOffset(pInfo, L"dwWriteSegment");
+	static const wchar_t* propPreferredSegment		= GetPropertyOffset(pInfo, L"PreferredSegment");
+	static const wchar_t* propHintedBank			= GetPropertyOffset(pInfo, L"HintedBank");
+	static const wchar_t* propdwEvictionSegment		= GetPropertyOffset(pInfo, L"dwEvictionSegment");
+	static const wchar_t* propPriority				= GetPropertyOffset(pInfo, L"Priority");
+	static const wchar_t* prophVidMmGlobalAlloc		= GetPropertyOffset(pInfo, L"hVidMmGlobalAlloc");
+	static const wchar_t* prophDxgGlobalAlloc		= GetPropertyOffset(pInfo, L"hDxgGlobalAlloc");
+	static const wchar_t* prophDxgSharedResource	= GetPropertyOffset(pInfo, L"hDxgSharedResource");
+	static const wchar_t* propUsageVersion			= GetPropertyOffset(pInfo, L"UsageVersion");
+	static const wchar_t* propUsageFlags			= GetPropertyOffset(pInfo, L"UsageFlags");
+	static const wchar_t* propFormat				= GetPropertyOffset(pInfo, L"Format");
+	static const wchar_t* propSwizzledFormat		= GetPropertyOffset(pInfo, L"SwizzledFormat");
+	static const wchar_t* propByteOffset			= GetPropertyOffset(pInfo, L"ByteOffset");
+	static const wchar_t* propWidth					= GetPropertyOffset(pInfo, L"Width");
+	static const wchar_t* propHeight				= GetPropertyOffset(pInfo, L"Height");
+	static const wchar_t* propPitch					= GetPropertyOffset(pInfo, L"Pitch");
+	static const wchar_t* propDepth					= GetPropertyOffset(pInfo, L"Depth");
+	static const wchar_t* propSlicePitch			= GetPropertyOffset(pInfo, L"SlicePitch");
+	static const wchar_t* propBackingStoreWasPinned = GetPropertyOffset(pInfo, L"BackingStoreWasPinned");
+	static const wchar_t* proppSectionObject		= GetPropertyOffset(pInfo, L"pSectionObject");
+	static const wchar_t* propPhysicalAdapterIndex	= GetPropertyOffset(pInfo, L"PhysicalAdapterIndex");
+	static const wchar_t* propPageTableOrDirectory	= GetPropertyOffset(pInfo, L"PageTableOrDirectory");
+
+	PVOID  hProcessId			 = GetProperty<PVOID>(pEvent, prophProcessId);
+	PVOID  hDevice				 = GetProperty<PVOID>(pEvent, prophDevice);
+	PVOID  pDxgAdapter			 = GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	UINT32 Flags				 = GetProperty<UINT32>(pEvent, propFlags);
+	UINT64 allocSize			 = GetProperty<UINT64>(pEvent, propallocSize);
+	UINT32 ulAlignment			 = GetProperty<UINT32>(pEvent, propulAlignment);
+	UINT32 dwReadSegment		 = GetProperty<UINT32>(pEvent, propdwReadSegment);
+	UINT32 dwWriteSegment		 = GetProperty<UINT32>(pEvent, propdwWriteSegment);
+	UINT32 PreferredSegment		 = GetProperty<UINT32>(pEvent, propPreferredSegment);
+	UINT32 HintedBank			 = GetProperty<UINT32>(pEvent, propHintedBank);
+	UINT32 dwEvictionSegment	 = GetProperty<UINT32>(pEvent, propdwEvictionSegment);
+	UINT32 Priority				 = GetProperty<UINT32>(pEvent, propPriority);
+	PVOID  hVidMmGlobalAlloc	 = GetProperty<PVOID>(pEvent, prophVidMmGlobalAlloc);
+	PVOID  hDxgGlobalAlloc		 = GetProperty<PVOID>(pEvent, prophDxgGlobalAlloc);
+	PVOID  hDxgSharedResource	 = GetProperty<PVOID>(pEvent, prophDxgSharedResource);
+	UINT32 UsageVersion			 = GetProperty<UINT32>(pEvent, propUsageVersion);
+	UINT32 UsageFlags			 = GetProperty<UINT32>(pEvent, propUsageFlags);
+	UINT32 Format				 = GetProperty<UINT32>(pEvent, propFormat);
+	UINT32 SwizzledFormat		 = GetProperty<UINT32>(pEvent, propSwizzledFormat);
+	UINT32 ByteOffset			 = GetProperty<UINT32>(pEvent, propByteOffset);
+	UINT32 Width				 = GetProperty<UINT32>(pEvent, propWidth);
+	UINT32 Height				 = GetProperty<UINT32>(pEvent, propHeight);
+	UINT32 Pitch				 = GetProperty<UINT32>(pEvent, propPitch);
+	UINT32 Depth				 = GetProperty<UINT32>(pEvent, propDepth);
+	UINT32 SlicePitch			 = GetProperty<UINT32>(pEvent, propSlicePitch);
+	DWORD  BackingStoreWasPinned = GetProperty<DWORD>(pEvent, propBackingStoreWasPinned);
+	PVOID  pSectionObject		 = GetProperty<PVOID>(pEvent, proppSectionObject);
+	UINT16 PhysicalAdapterIndex	 = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
+	DWORD  PageTableOrDirectory	 = GetProperty<DWORD>(pEvent, propPageTableOrDirectory);
+	RemoveGlobalAlloc(hVidMmGlobalAlloc);
+}
+
+void HandleDeviceAllocationStart(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* prophProcessId				   = GetPropertyOffset(pInfo, L"hProcessId");
+	static const wchar_t* prophDevice					   = GetPropertyOffset(pInfo, L"hDevice");
+	static const wchar_t* proppDxgAdapter				   = GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* prophVidMmAlloc				   = GetPropertyOffset(pInfo, L"hVidMmAlloc");
+	static const wchar_t* prophVidMmGlobalAlloc			   = GetPropertyOffset(pInfo, L"hVidMmGlobalAlloc");
+	static const wchar_t* prophDxgResource				   = GetPropertyOffset(pInfo, L"hDxgResource");
+	static const wchar_t* prophDxgSharedResource		   = GetPropertyOffset(pInfo, L"hDxgSharedResource");
+	static const wchar_t* prophThunkAllocation			   = GetPropertyOffset(pInfo, L"hThunkAllocation");
+	static const wchar_t* prophThunkResource			   = GetPropertyOffset(pInfo, L"hThunkResource");
+	static const wchar_t* propPrivateRuntimeResourceHandle = GetPropertyOffset(pInfo, L"PrivateRuntimeResourceHandle");
+	static const wchar_t* proppVirtualAddress			   = GetPropertyOffset(pInfo, L"pVirtualAddress");
+	static const wchar_t* prophProcessAllocDetails		   = GetPropertyOffset(pInfo, L"hProcessAllocDetails");
+	static const wchar_t* prophOtherPartitionHandle		   = GetPropertyOffset(pInfo, L"hOtherPartitionHandle");
+
+	PVOID  hProcessId					= GetProperty<PVOID>(pEvent, prophProcessId);
+	PVOID  hDevice						= GetProperty<PVOID>(pEvent, prophDevice);
+	PVOID  pDxgAdapter					= GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	PVOID  hVidMmAlloc					= GetProperty<PVOID>(pEvent, prophVidMmAlloc);
+	PVOID  hVidMmGlobalAlloc			= GetProperty<PVOID>(pEvent, prophVidMmGlobalAlloc);
+	PVOID  hDxgResource					= GetProperty<PVOID>(pEvent, prophDxgResource);
+	PVOID  hDxgSharedResource			= GetProperty<PVOID>(pEvent, prophDxgSharedResource);
+	PVOID  hThunkAllocation				= GetProperty<PVOID>(pEvent, prophThunkAllocation);
+	PVOID  hThunkResource				= GetProperty<PVOID>(pEvent, prophThunkResource);
+	PVOID  PrivateRuntimeResourceHandle = GetProperty<PVOID>(pEvent, propPrivateRuntimeResourceHandle);
+	PVOID  pVirtualAddress				= GetProperty<PVOID>(pEvent, proppVirtualAddress);
+	PVOID  hProcessAllocDetails			= GetProperty<PVOID>(pEvent, prophProcessAllocDetails);
+	UINT32 hOtherPartitionHandle		= GetProperty<UINT32>(pEvent, prophOtherPartitionHandle);
+
+	GlobalAllocDescription* pGlobal = FindOrAddGlobal(hVidMmGlobalAlloc);
+	pGlobal->Allocs.push_back(hVidMmAlloc);
+	g_AllocToGlobal[hVidMmAlloc] = hVidMmGlobalAlloc;
+
+	dprintf(hProcessId, "DEVICE_ALLOC %p / %p\n", hVidMmGlobalAlloc, hVidMmAlloc);
+}
+
+void HandleDeviceAllocationStop(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* prophProcessId				   = GetPropertyOffset(pInfo, L"hProcessId");
+	static const wchar_t* prophDevice					   = GetPropertyOffset(pInfo, L"hDevice");
+	static const wchar_t* proppDxgAdapter				   = GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* prophVidMmAlloc				   = GetPropertyOffset(pInfo, L"hVidMmAlloc");
+	static const wchar_t* prophVidMmGlobalAlloc			   = GetPropertyOffset(pInfo, L"hVidMmGlobalAlloc");
+	static const wchar_t* prophDxgResource				   = GetPropertyOffset(pInfo, L"hDxgResource");
+	static const wchar_t* prophDxgSharedResource		   = GetPropertyOffset(pInfo, L"hDxgSharedResource");
+	static const wchar_t* prophThunkAllocation			   = GetPropertyOffset(pInfo, L"hThunkAllocation");
+	static const wchar_t* prophThunkResource			   = GetPropertyOffset(pInfo, L"hThunkResource");
+	static const wchar_t* propPrivateRuntimeResourceHandle = GetPropertyOffset(pInfo, L"PrivateRuntimeResourceHandle");
+	static const wchar_t* proppVirtualAddress			   = GetPropertyOffset(pInfo, L"pVirtualAddress");
+	static const wchar_t* prophProcessAllocDetails		   = GetPropertyOffset(pInfo, L"hProcessAllocDetails");
+	static const wchar_t* prophOtherPartitionHandle		   = GetPropertyOffset(pInfo, L"hOtherPartitionHandle");
+
+	PVOID  hProcessId					= GetProperty<PVOID>(pEvent, prophProcessId);
+	PVOID  hDevice						= GetProperty<PVOID>(pEvent, prophDevice);
+	PVOID  pDxgAdapter					= GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	PVOID  hVidMmAlloc					= GetProperty<PVOID>(pEvent, prophVidMmAlloc);
+	PVOID  hVidMmGlobalAlloc			= GetProperty<PVOID>(pEvent, prophVidMmGlobalAlloc);
+	PVOID  hDxgResource					= GetProperty<PVOID>(pEvent, prophDxgResource);
+	PVOID  hDxgSharedResource			= GetProperty<PVOID>(pEvent, prophDxgSharedResource);
+	PVOID  hThunkAllocation				= GetProperty<PVOID>(pEvent, prophThunkAllocation);
+	PVOID  hThunkResource				= GetProperty<PVOID>(pEvent, prophThunkResource);
+	PVOID  PrivateRuntimeResourceHandle = GetProperty<PVOID>(pEvent, propPrivateRuntimeResourceHandle);
+	PVOID  pVirtualAddress				= GetProperty<PVOID>(pEvent, proppVirtualAddress);
+	PVOID  hProcessAllocDetails			= GetProperty<PVOID>(pEvent, prophProcessAllocDetails);
+	UINT32 hOtherPartitionHandle		= GetProperty<UINT32>(pEvent, prophOtherPartitionHandle);
+
+	GlobalAllocDescription* pGlobal = FindOrAddGlobal(hVidMmGlobalAlloc);
+	{
+		auto itr = std::find(pGlobal->Allocs.begin(), pGlobal->Allocs.end(), hVidMmAlloc);
+		if(itr != pGlobal->Allocs.end())
+		{
+			pGlobal->Allocs.erase(itr);
+		}
+	}
+	{
+		auto itr = g_AllocToGlobal.find(hVidMmAlloc);
+		if(itr != g_AllocToGlobal.end())
+			g_AllocToGlobal.erase(itr);
+	}
+}
+
+void HandlePagingOpVirtualTransfer(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* proppDxgAdapter				= GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* prophDmaBuffer				= GetPropertyOffset(pInfo, L"hDmaBuffer");
+	static const wchar_t* propContinueNextBuffer		= GetPropertyOffset(pInfo, L"ContinueNextBuffer");
+	static const wchar_t* prophAllocationGlobalHandle	= GetPropertyOffset(pInfo, L"hAllocationGlobalHandle");
+	static const wchar_t* propAllocationOffset			= GetPropertyOffset(pInfo, L"AllocationOffset");
+	static const wchar_t* propTransferSize				= GetPropertyOffset(pInfo, L"TransferSize");
+	static const wchar_t* propSourceSegmentId			= GetPropertyOffset(pInfo, L"SourceSegmentId");
+	static const wchar_t* propDestinationSegmentId		= GetPropertyOffset(pInfo, L"DestinationSegmentId");
+	static const wchar_t* propSourceVirtualAddress		= GetPropertyOffset(pInfo, L"SourceVirtualAddress");
+	static const wchar_t* propDestinationVirtualAddress = GetPropertyOffset(pInfo, L"DestinationVirtualAddress");
+	static const wchar_t* propSourcePageTable			= GetPropertyOffset(pInfo, L"SourcePageTable");
+	static const wchar_t* propTransferDirection			= GetPropertyOffset(pInfo, L"TransferDirection");
+	static const wchar_t* propTransferFlags				= GetPropertyOffset(pInfo, L"TransferFlags");
+	static const wchar_t* propDestinationPageTable		= GetPropertyOffset(pInfo, L"DestinationPageTable");
+	static const wchar_t* propSourceSegmentOffset		= GetPropertyOffset(pInfo, L"SourceSegmentOffset");
+	static const wchar_t* propDestinationSegmentOffset	= GetPropertyOffset(pInfo, L"DestinationSegmentOffset");
+
+	PVOID  pDxgAdapter				 = GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	PVOID  hDmaBuffer				 = GetProperty<PVOID>(pEvent, prophDmaBuffer);
+	DWORD  ContinueNextBuffer		 = GetProperty<DWORD>(pEvent, propContinueNextBuffer);
+	PVOID  hAllocationGlobalHandle	 = GetProperty<PVOID>(pEvent, prophAllocationGlobalHandle);
+	UINT64 AllocationOffset			 = GetProperty<UINT64>(pEvent, propAllocationOffset);
+	UINT64 TransferSize				 = GetProperty<UINT64>(pEvent, propTransferSize);
+	UINT32 SourceSegmentId			 = GetProperty<UINT32>(pEvent, propSourceSegmentId);
+	UINT32 DestinationSegmentId		 = GetProperty<UINT32>(pEvent, propDestinationSegmentId);
+	UINT64 SourceVirtualAddress		 = GetProperty<UINT64>(pEvent, propSourceVirtualAddress);
+	UINT64 DestinationVirtualAddress = GetProperty<UINT64>(pEvent, propDestinationVirtualAddress);
+	UINT64 SourcePageTable			 = GetProperty<UINT64>(pEvent, propSourcePageTable);
+	UINT32 TransferDirection		 = GetProperty<UINT32>(pEvent, propTransferDirection);
+	UINT32 TransferFlags			 = GetProperty<UINT32>(pEvent, propTransferFlags);
+	UINT64 DestinationPageTable		 = GetProperty<UINT64>(pEvent, propDestinationPageTable);
+	UINT64 SourceSegmentOffset		 = GetProperty<UINT64>(pEvent, propSourceSegmentOffset);
+	UINT64 DestinationSegmentOffset	 = GetProperty<UINT64>(pEvent, propDestinationSegmentOffset);
+
+
+	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
+	dprintf(pGlobal->ProcessId, "OpVirtualTransfer %p :: %04x segment %d -> %d .. %8.3fKB\n", hAllocationGlobalHandle, pGlobal-> CommittedSegments, SourceSegmentId, DestinationSegmentId, pGlobal->Size / (1024.f));
+
+}
+
+void HandlePagingOpNotifyResidency(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* proppDxgAdapter			  = GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* prophDmaBuffer			  = GetPropertyOffset(pInfo, L"hDmaBuffer");
+	static const wchar_t* propContinueNextBuffer	  = GetPropertyOffset(pInfo, L"ContinueNextBuffer");
+	static const wchar_t* prophAllocationGlobalHandle = GetPropertyOffset(pInfo, L"hAllocationGlobalHandle");
+	static const wchar_t* propSegmentId				  = GetPropertyOffset(pInfo, L"SegmentId");
+	static const wchar_t* propSegmentOffset			  = GetPropertyOffset(pInfo, L"SegmentOffset");
+	static const wchar_t* propFlags					  = GetPropertyOffset(pInfo, L"Flags");
+
+	PVOID					pDxgAdapter				= GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	PVOID					hDmaBuffer				= GetProperty<PVOID>(pEvent, prophDmaBuffer);
+	DWORD					ContinueNextBuffer		= GetProperty<DWORD>(pEvent, propContinueNextBuffer);
+	PVOID					hAllocationGlobalHandle = GetProperty<PVOID>(pEvent, prophAllocationGlobalHandle);
+	UINT32					SegmentId				= GetProperty<UINT32>(pEvent, propSegmentId);
+	UINT64					SegmentOffset			= GetProperty<UINT64>(pEvent, propSegmentOffset);
+	UINT32					Flags					= GetProperty<UINT32>(pEvent, propFlags);
+	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
+
+	dprintf(pGlobal->ProcessId, "NotifyResidency %p :: segment %d\n", hAllocationGlobalHandle, SegmentId);
+}
+
+void HandlePagingOpSysmemCommit(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* proppDxgAdapter			  = GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* prophAllocationGlobalHandle = GetPropertyOffset(pInfo, L"hAllocationGlobalHandle");
+	static const wchar_t* propSegmentId				  = GetPropertyOffset(pInfo, L"SegmentId");
+
+	PVOID					pDxgAdapter				= GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	PVOID					hAllocationGlobalHandle = GetProperty<PVOID>(pEvent, prophAllocationGlobalHandle);
+	UINT32					SegmentId				= GetProperty<UINT32>(pEvent, propSegmentId);
+	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
+	if(IsTracked(pGlobal))
+	{
+		OutputDebugStringA("LAL");
+	}
+	pGlobal->CommittedSegments |= (1 << SegmentId);
+	dprintf(pGlobal->ProcessId, "SysmemCommitSegment %p [%x] / %8.5fKB\n", hAllocationGlobalHandle, pGlobal->CommittedSegments, pGlobal->Size / (1024.f));
+}
+
+void HandlePagingOpSysmemUncommit(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* proppDxgAdapter			  = GetPropertyOffset(pInfo, L"pDxgAdapter");
+	static const wchar_t* prophAllocationGlobalHandle = GetPropertyOffset(pInfo, L"hAllocationGlobalHandle");
+	static const wchar_t* propSegmentId				  = GetPropertyOffset(pInfo, L"SegmentId");
+
+	PVOID					pDxgAdapter				= GetProperty<PVOID>(pEvent, proppDxgAdapter);
+	PVOID					hAllocationGlobalHandle = GetProperty<PVOID>(pEvent, prophAllocationGlobalHandle);
+	UINT32					SegmentId				= GetProperty<UINT32>(pEvent, propSegmentId);
+	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
+	if(IsTracked(pGlobal))
+	{
+		OutputDebugStringA("LAL");
+	}
+	pGlobal->CommittedSegments &= ~(1 << SegmentId);
+	dprintf(pGlobal->ProcessId, "SysmemUncommitSegment %p [%x] %d / %8.5fMB\n", hAllocationGlobalHandle, pGlobal->CommittedSegments, SegmentId, pGlobal->Size / (1024.f));
+}
+
 void HandleVidMmProcessBudgetChange(PEVENT_RECORD pEvent)
 {
-
 	static PTRACE_EVENT_INFO pInfo					  = ExtractEventInformation(pEvent);
 	static const wchar_t*	 propNewBudget			  = GetPropertyOffset(pInfo, L"NewBudget");
 	static const wchar_t*	 propOldBudget			  = GetPropertyOffset(pInfo, L"OldBudget");
@@ -579,7 +964,7 @@ void HandleVidMmProcessBudgetChange(PEVENT_RECORD pEvent)
 
 	UINT64 NewBudget			= GetProperty<UINT64>(pEvent, propNewBudget);
 	UINT64 OldBudget			= GetProperty<UINT64>(pEvent, propOldBudget);
-	void*  pDxgAdapter			= GetProperty<void*>(pEvent, proppDxgAdapter);
+	PVOID  pDxgAdapter			= GetProperty<PVOID>(pEvent, proppDxgAdapter);
 	UINT32 ProcessId			= GetProperty<UINT32>(pEvent, propProcessId);
 	UINT16 PhysicalAdapterIndex = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
 	UINT8  NewPriorityBand		= GetProperty<UINT8>(pEvent, propNewPriorityBand);
@@ -602,7 +987,7 @@ void HandleVidMmProcessUsageChange(PEVENT_RECORD pEvent)
 
 	UINT64 NewUsage				= GetProperty<UINT64>(pEvent, propNewUsage);
 	UINT64 OldUsage				= GetProperty<UINT64>(pEvent, propOldUsage);
-	void*  pDxgAdapter			= GetProperty<void*>(pEvent, proppDxgAdapter);
+	PVOID  pDxgAdapter			= GetProperty<PVOID>(pEvent, proppDxgAdapter);
 	UINT32 ProcessId			= GetProperty<UINT32>(pEvent, propProcessId);
 	UINT16 PhysicalAdapterIndex = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
 	UINT8  MemorySegmentGroup	= GetProperty<UINT8>(pEvent, propMemorySegmentGroup);
@@ -627,7 +1012,7 @@ void HandleVidMmProcessDemotedCommitmentChange(PEVENT_RECORD pEvent)
 
 	UINT64 Commitment			= GetProperty<UINT64>(pEvent, propCommitment);
 	UINT64 OldCommitment		= GetProperty<UINT64>(pEvent, propOldCommitment);
-	void*  pDxgAdapter			= GetProperty<void*>(pEvent, proppDxgAdapter);
+	PVOID  pDxgAdapter			= GetProperty<PVOID>(pEvent, proppDxgAdapter);
 	UINT32 ProcessId			= GetProperty<UINT32>(pEvent, propProcessId);
 	UINT16 PhysicalAdapterIndex = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
 	UINT8  PriorityClass		= GetProperty<UINT8>(pEvent, propPriorityClass);
@@ -656,16 +1041,10 @@ void HandleVidMmProcessCommitmentChange(PEVENT_RECORD pEvent)
 
 	UINT64 Commitment			= GetProperty<UINT64>(pEvent, propCommitment);
 	UINT64 OldCommitment		= GetProperty<UINT64>(pEvent, propOldCommitment);
-	void*  pDxgAdapter			= GetProperty<void*>(pEvent, proppDxgAdapter);
+	PVOID  pDxgAdapter			= GetProperty<PVOID>(pEvent, proppDxgAdapter);
 	UINT32 ProcessId			= GetProperty<UINT32>(pEvent, propProcessId);
 	UINT16 PhysicalAdapterIndex = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
 	UINT8  MemorySegmentGroup	= GetProperty<UINT8>(pEvent, propMemorySegmentGroup);
-
-	ProcessMemory* memory = FindProcessMemory(ProcessId, pDxgAdapter);
-	if(MemorySegmentGroup)
-		memory->CommitmentNonLocal = Commitment;
-	else
-		memory->CommitmentLocal = Commitment;
 }
 
 void HandleReportSegment(PEVENT_RECORD pEvent)
@@ -701,6 +1080,9 @@ void HandleReportSegment(PEVENT_RECORD pEvent)
 	} D3DKMT_MEMORY_SEGMENT_GROUP;
 
 	Adapter* adapter = FindAdapter(pDxgAdapter);
+
+	dprintf(0, "Report Segment %p/%ls // %d grp %d :: %8.5fMB\n", pDxgAdapter, adapter->name.c_str(), ulSegmentId, MemorySegmentGroup, Size / (1024.f * 1024.f));
+
 	if(MemorySegmentGroup == D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL)
 		adapter->SegmentLocalMemory[ulSegmentId % MAX_SEGMENTS] = Size;
 	else
@@ -723,7 +1105,6 @@ void HandleReportSegment(PEVENT_RECORD pEvent)
 
 void HandleAdapterStart(PEVENT_RECORD pEvent)
 {
-
 	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
 
 	static const wchar_t* propulSegmentId				 = GetPropertyOffset(pInfo, L"ulSegmentId");
@@ -788,6 +1169,35 @@ void HandleDxgKrnlEvent(PEVENT_RECORD pEvent)
 	case DpiReportAdapter_Info:
 		HandleDpiReportAdapter(pEvent);
 		break;
+	case AdapterAllocation_Start:
+	case AdapterAllocation_DCStart:
+		HandleAdapterAllocationStart(pEvent);
+		break;
+	case AdapterAllocation_Stop:
+		HandleAdapterAllocationStop(pEvent);
+		break;
+
+	case DeviceAllocation_Start:
+	case DeviceAllocation_DCStart:
+		HandleDeviceAllocationStart(pEvent);
+		break;
+	case DeviceAllocation_Stop:
+		HandleDeviceAllocationStop(pEvent);
+		break;
+
+	case PagingOpVirtualTransfer:
+		HandlePagingOpVirtualTransfer(pEvent);
+		break;
+	case PagingOpNotifyResidency:
+		HandlePagingOpNotifyResidency(pEvent);
+		break;
+	case PagingOpSysmemCommit:
+		HandlePagingOpSysmemCommit(pEvent);
+		break;
+	case PagingOpSysmemUncommit:
+		HandlePagingOpSysmemUncommit(pEvent);
+		break;
+
 	default:
 		break;
 	}
@@ -907,8 +1317,8 @@ void GetConsoleSize(int& width, int& height)
 
 void FormatMemory(SIZE_T bytes, char* buffer, size_t bufSize)
 {
-	double	   b	 = (double)bytes;
-	int		   x	 = 0;
+	double b = (double)bytes;
+	int	   x = 0;
 	for(int i = 0; i < g_minSize; ++i)
 	{
 		b /= 1024.f;
@@ -1108,7 +1518,7 @@ void ConsoleUpdate()
 	if(g_detailedAvailable && g_detailedMode)
 	{
 		showDetailed = true;
-		fixedWidth	   = fixedWidthAll;
+		fixedWidth	 = fixedWidthAll;
 	}
 
 	int barWidth = g_consoleWidth - fixedWidth;
@@ -1168,8 +1578,8 @@ void ConsoleUpdate()
 	};
 
 	g_currentColor = CYAN;
-	PutFormat("%-*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth-1, "Usage", memoryWidth-1, "Commit");
-	PutFormat("%*s  ", memoryWidth-1, "Demoted");
+	PutFormat("%-*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth - 1, "Usage", memoryWidth - 1, "Commit");
+	PutFormat("%*s  ", memoryWidth - 1, "Demoted");
 	if(showDetailed)
 	{
 		WritePrios();
@@ -1232,7 +1642,6 @@ void ConsoleUpdate()
 			g_currentColor = CYAN;
 			PutFormat(" %*s", memoryWidth, memBuffer);
 
-			
 			if(showDetailed)
 			{
 				int idx = 0;
@@ -1481,7 +1890,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 			ReadConsoleInput(g_hConsoleInput, &Record, 1, &Length);
 			WORD ch = Record.Event.KeyEvent.wVirtualKeyCode;
 			if(Record.Event.KeyEvent.bKeyDown && ch != 0)
-			{				
+			{
 				if(ch == 'G')
 				{
 					g_minSize = g_minSize == 3 ? 0 : 3;
@@ -1520,6 +1929,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 		ConsoleUpdate();
 		HANDLE handles[] = { g_hRedrawEvent, g_hConsoleInput };
 		WaitForMultipleObjects(2, handles, FALSE, 1000);
+		Sleep(4000);
 	}
 
 	traceThread.join();
@@ -1531,4 +1941,27 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 	free(pSessionProperties);
 
 	return 0;
+}
+
+static void dprintf(LPVOID pid, const char* fmt, ...)
+{
+	if(0 != pid && !FindProcess((DWORD)(INT64)pid)->isTracked)
+	{
+		return;
+	}
+
+	char buffer[4096];
+
+	va_list args;
+	va_start(args, fmt);
+	int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+	va_end(args);
+
+	if(len < 0)
+		return;
+
+	// Ensure null-termination even if truncated
+	buffer[sizeof(buffer) - 1] = '\0';
+
+	OutputDebugStringA(buffer);
 }
