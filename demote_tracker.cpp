@@ -685,7 +685,7 @@ void HandleAdapterAllocationStart(PEVENT_RECORD pEvent)
 	pGlobal->CommittedSegments = 0;
 	pGlobal->PreferredSegment  = PreferredSegment;
 	pGlobal->EvictedSegment	   = dwEvictionSegment;
-	dprintf(hProcessId, "ADAPTER_ALLOC %p / %8.5fKB\n", hVidMmGlobalAlloc, (float)allocSize / (1024.f));
+	dprintf(hProcessId, "ADAPTER_ALLOC %p / [%d/%d] %8.5fKB\n", hVidMmGlobalAlloc, dwReadSegment, dwWriteSegment, (float)allocSize / (1024.f));
 }
 
 void HandleAdapterAllocationStop(PEVENT_RECORD pEvent)
@@ -751,6 +751,9 @@ void HandleAdapterAllocationStop(PEVENT_RECORD pEvent)
 	PVOID  pSectionObject		 = GetProperty<PVOID>(pEvent, proppSectionObject);
 	UINT16 PhysicalAdapterIndex	 = GetProperty<UINT16>(pEvent, propPhysicalAdapterIndex);
 	DWORD  PageTableOrDirectory	 = GetProperty<DWORD>(pEvent, propPageTableOrDirectory);
+
+	dprintf(hProcessId, "ADAPTER_ALLOC_STOP %p / [%d/%d] %8.5fKB\n", hVidMmGlobalAlloc, dwReadSegment, dwWriteSegment, (float)allocSize / (1024.f));
+
 	RemoveGlobalAlloc(hVidMmGlobalAlloc);
 }
 
@@ -825,6 +828,8 @@ void HandleDeviceAllocationStop(PEVENT_RECORD pEvent)
 	PVOID  hProcessAllocDetails			= GetProperty<PVOID>(pEvent, prophProcessAllocDetails);
 	UINT32 hOtherPartitionHandle		= GetProperty<UINT32>(pEvent, prophOtherPartitionHandle);
 
+	dprintf(hProcessId, "DEVICE_ALLOC_STOP %p / %p\n", hVidMmGlobalAlloc, hVidMmAlloc);
+
 	GlobalAllocDescription* pGlobal = FindOrAddGlobal(hVidMmGlobalAlloc);
 	{
 		auto itr = std::find(pGlobal->Allocs.begin(), pGlobal->Allocs.end(), hVidMmAlloc);
@@ -878,10 +883,14 @@ void HandlePagingOpVirtualTransfer(PEVENT_RECORD pEvent)
 	UINT64 SourceSegmentOffset		 = GetProperty<UINT64>(pEvent, propSourceSegmentOffset);
 	UINT64 DestinationSegmentOffset	 = GetProperty<UINT64>(pEvent, propDestinationSegmentOffset);
 
-
-	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
-	dprintf(pGlobal->ProcessId, "OpVirtualTransfer %p :: %04x segment %d -> %d .. %8.3fKB\n", hAllocationGlobalHandle, pGlobal-> CommittedSegments, SourceSegmentId, DestinationSegmentId, pGlobal->Size / (1024.f));
-
+	GlobalAllocDescription* pGlobal = FindOrAddGlobal(hAllocationGlobalHandle);
+	dprintf(pGlobal->ProcessId,
+			"OpVirtualTransfer %p :: %04x segment %d -> %d .. %8.3fKB\n",
+			hAllocationGlobalHandle,
+			pGlobal->CommittedSegments,
+			SourceSegmentId,
+			DestinationSegmentId,
+			pGlobal->Size / (1024.f));
 }
 
 void HandlePagingOpNotifyResidency(PEVENT_RECORD pEvent)
@@ -920,10 +929,6 @@ void HandlePagingOpSysmemCommit(PEVENT_RECORD pEvent)
 	PVOID					hAllocationGlobalHandle = GetProperty<PVOID>(pEvent, prophAllocationGlobalHandle);
 	UINT32					SegmentId				= GetProperty<UINT32>(pEvent, propSegmentId);
 	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
-	if(IsTracked(pGlobal))
-	{
-		OutputDebugStringA("LAL");
-	}
 	pGlobal->CommittedSegments |= (1 << SegmentId);
 	dprintf(pGlobal->ProcessId, "SysmemCommitSegment %p [%x] / %8.5fKB\n", hAllocationGlobalHandle, pGlobal->CommittedSegments, pGlobal->Size / (1024.f));
 }
@@ -940,12 +945,54 @@ void HandlePagingOpSysmemUncommit(PEVENT_RECORD pEvent)
 	PVOID					hAllocationGlobalHandle = GetProperty<PVOID>(pEvent, prophAllocationGlobalHandle);
 	UINT32					SegmentId				= GetProperty<UINT32>(pEvent, propSegmentId);
 	GlobalAllocDescription* pGlobal					= FindOrAddGlobal(hAllocationGlobalHandle);
-	if(IsTracked(pGlobal))
-	{
-		OutputDebugStringA("LAL");
-	}
 	pGlobal->CommittedSegments &= ~(1 << SegmentId);
 	dprintf(pGlobal->ProcessId, "SysmemUncommitSegment %p [%x] %d / %8.5fMB\n", hAllocationGlobalHandle, pGlobal->CommittedSegments, SegmentId, pGlobal->Size / (1024.f));
+}
+
+void HandleTerminateAllocation_Inner(void* hVidMmAlloc)
+{
+
+	GlobalAllocDescription* pGlobal = nullptr;
+	void* hGlobal;
+	{
+		auto  itr	  = g_AllocToGlobal.find(hVidMmAlloc);
+		hGlobal = (*itr).second;
+		g_AllocToGlobal.erase(itr);
+		pGlobal = FindOrAddGlobal(hGlobal);
+	}
+	auto itr = std::find(pGlobal->Allocs.begin(), pGlobal->Allocs.end(), hVidMmAlloc);
+
+	if(itr != pGlobal->Allocs.end())
+	{
+		pGlobal->Allocs.erase(itr);
+	}
+
+	dprintf(pGlobal->ProcessId, "TerminateAllocation %p / %p %8.5fKB\n", hVidMmAlloc, pGlobal->VidMmGlobal, pGlobal->Size / (1024.f));
+
+	if(0 == pGlobal->Allocs.size())
+	{
+		RemoveGlobalAlloc(hGlobal);
+	}
+}
+
+void HandleTerminateAllocationInfo(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* prophVidMmAlloc = GetPropertyOffset(pInfo, L"hVidMmAlloc");
+
+	void* hVidMmAlloc = GetProperty<void*>(pEvent, prophVidMmAlloc);
+	HandleTerminateAllocation_Inner(hVidMmAlloc);
+}
+
+void HandleProcessTerminateAllocationInfo(PEVENT_RECORD pEvent)
+{
+	static PTRACE_EVENT_INFO pInfo = ExtractEventInformation(pEvent);
+
+	static const wchar_t* prophVidMmAlloc = GetPropertyOffset(pInfo, L"hVidMmAlloc");
+
+	void* hVidMmAlloc = GetProperty<void*>(pEvent, prophVidMmAlloc);
+	HandleTerminateAllocation_Inner(hVidMmAlloc);
 }
 
 void HandleVidMmProcessBudgetChange(PEVENT_RECORD pEvent)
