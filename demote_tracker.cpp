@@ -174,6 +174,8 @@ struct ProcessMemory
 	UINT64 CommitmentNonLocal;
 	UINT64 UsageLocal;
 	UINT64 UsageNonLocal;
+	UINT64 BudgetNonLocal;
+	UINT64 BudgetLocal;
 	UINT64 CommitmentDemoted[PRIO_COUNT];
 
 	void Reset()
@@ -618,6 +620,13 @@ void HandleVidMmProcessBudgetChange(PEVENT_RECORD pEvent)
 	UINT8  NewVisibilityState	= GetProperty<UINT8>(pEvent, propNewVisibilityState);
 	UINT8  OldVisibilityState	= GetProperty<UINT8>(pEvent, propOldVisibilityState);
 	UINT8  MemorySegmentGroup	= GetProperty<UINT8>(pEvent, propMemorySegmentGroup);
+
+	ProcessMemory* memory = FindProcessMemory(ProcessId, pDxgAdapter);
+	if(MemorySegmentGroup)
+		memory->BudgetNonLocal = NewBudget;
+	else
+		memory->BudgetLocal = NewBudget;
+
 }
 
 void HandleVidMmProcessUsageChange(PEVENT_RECORD pEvent)
@@ -1138,8 +1147,8 @@ void ConsoleUpdate()
 
 	bool showDetailed = false;
 
-	int fixedWidth		= nameWidth + 3 * (1 + memoryWidth) - 1;
-	int fixedWidthAll	= nameWidth + (3 + 4) * (1 + memoryWidth) - 1;
+	int fixedWidth		= nameWidth + 4 * (1 + memoryWidth) - 1;
+	int fixedWidthAll	= nameWidth + (4 + 4) * (1 + memoryWidth) - 1;
 	g_detailedAvailable = fixedWidthAll + 15 < g_consoleWidth;
 	if(g_detailedAvailable && g_detailedMode)
 	{
@@ -1183,7 +1192,14 @@ void ConsoleUpdate()
 	{
 		g_currentColor = GetAdapterColor(adapter);
 		Adapter* a	   = FindAdapter(adapter);
-		PutFormat("[%ls (%.1fGB)] ", a->name.c_str(), a->LocalMemory / (1024.0 * 1024.0 * 1024.0));
+		uint64_t allocated = 0;
+		for(const ProcessMemory* procMem : processes)
+		{
+			if(procMem->pDxgAdapter == a->pDxgAdapter)
+				allocated += procMem->UsageLocal;
+		}
+
+		PutFormat("[%ls (%.1fGB / %.1fGB)] ", a->name.c_str(), allocated / (1024.0 * 1024.0 * 1024.0), a->LocalMemory / (1024.0 * 1024.0 * 1024.0));
 	}
 	NextLine();
 	auto WritePrios = []()
@@ -1205,6 +1221,7 @@ void ConsoleUpdate()
 
 	g_currentColor = CYAN;
 	PutFormat("%-*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth - 1, "Usage", memoryWidth - 1, "Commit");
+	PutFormat("%*s  ", memoryWidth - 1, "Budget");
 	PutFormat("%*s  ", memoryWidth - 1, "Demoted");
 	if(showDetailed)
 	{
@@ -1269,6 +1286,11 @@ void ConsoleUpdate()
 			FormatMemory(procMem->CommitmentLocal, memBuffer, sizeof(memBuffer));
 			g_currentColor = CYAN;
 			PutFormat(" %*s", memoryWidth, memBuffer);
+
+			FormatMemory(procMem->BudgetLocal, memBuffer, sizeof(memBuffer));
+			g_currentColor = CYAN;
+			PutFormat(" %*s", memoryWidth, memBuffer);
+
 
 			if(showDetailed)
 			{
