@@ -524,18 +524,17 @@ void OnProcessStop(DWORD pid, uint64_t timestamp)
 }
 
 // VidMm reports arrive even after the process is dead.
-// keep Process objects alive for 2 minutes, and then trim them
+// keep Process objects alive for 2 minutes (check every 30s), and then trim them
 void TrimProcesses()
 {
 	LARGE_INTEGER Freq, Counter;
 	QueryPerformanceFrequency(&Freq);
 	QueryPerformanceCounter(&Counter);
 	static int64_t LastUpdate = 0;
-	if(LastUpdate < Counter.QuadPart + Freq.QuadPart * 30)
+	if(Counter.QuadPart > LastUpdate + Freq.QuadPart * 30)
 	{
 		LastUpdate	  = Counter.QuadPart;
-		int64_t limit = Counter.QuadPart + 120 * Freq.QuadPart;
-
+		int64_t limit = Counter.QuadPart - 120 * Freq.QuadPart;
 		for(Process& proc : g_processes)
 		{
 			DWORD pid = proc.pid;
@@ -782,13 +781,18 @@ void HandleDpiReportAdapter(PEVENT_RECORD pEvent)
 
 	LPVOID		   pDxgAdapter = GetProperty<LPVOID>(pEvent, proppDxgAdapter);
 	UINT64		   Luid		   = GetProperty<UINT64>(pEvent, propAdapterLuid);
-	IDXGIFactory4* pFactory;
-	CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)&pFactory);
+	IDXGIFactory4* pFactory	   = nullptr;
+	if(FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)&pFactory)))
+		return;
 	LUID luid;
 	memcpy(&luid, &Luid, sizeof(luid));
-	IDXGIAdapter1* pAdapter;
+	IDXGIAdapter1* pAdapter = nullptr;
 
-	pFactory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void**)&pAdapter);
+	if(FAILED(pFactory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void**)&pAdapter)))
+	{
+		pFactory->Release();
+		return;
+	}
 
 	DXGI_ADAPTER_DESC1 desc;
 	pAdapter->GetDesc1(&desc);
